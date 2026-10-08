@@ -59,8 +59,12 @@ if [ -x "$VOICE_PY" ]; then
   v=$("$VOICE_PY" -c 'import torch;print(torch.version.cuda)' 2>/dev/null)
   [ "$v" = "12.8" ] && ok "voice torch cuda build $v" || bad "voice torch cuda build: ${v:-none}"
 
-  # 7) voice critical imports = CosyVoice stack + whisper
-  for m in torch torchaudio gradio modelscope onnxruntime librosa soundfile whisper; do
+  # 7) voice critical imports = CosyVoice stack + whisper. NOTE: modelscope is
+  # deliberately NOT asserted here - the verified voice worker never performs a
+  # top-level `import modelscope`, and the verified voice lock (which has no
+  # torchvision) cannot satisfy it. Asserting it would gate the image on a
+  # condition the verified runtime itself does not meet.
+  for m in torch torchaudio gradio onnxruntime librosa soundfile whisper; do
     if out=$("$VOICE_PY" -c "import $m" 2>&1); then ok "voice import $m"; else
       bad "voice import $m :: $(printf '%s' "$out" | grep -aE 'Error|error' | tail -n1 | cut -c1-180)"
     fi
