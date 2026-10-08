@@ -37,7 +37,9 @@ if [ -x "$MAIN_PY" ]; then
            torchsde torchvision torchaudio transformers tokenizers sentencepiece \
            sqlalchemy alembic onnx onnxruntime cv2 albumentations ultralytics \
            segment_anything; do
-    if "$MAIN_PY" -c "import $m" >/dev/null 2>&1; then ok "main import $m"; else bad "main import $m"; fi
+    if out=$("$MAIN_PY" -c "import $m" 2>&1); then ok "main import $m"; else
+      bad "main import $m :: $(printf '%s' "$out" | grep -aE 'Error|error' | tail -n1 | cut -c1-180)"
+    fi
   done
 
   # 4) non-fatal: frontend/docs packages are optional at import time
@@ -59,7 +61,9 @@ if [ -x "$VOICE_PY" ]; then
 
   # 7) voice critical imports = CosyVoice stack + whisper
   for m in torch torchaudio gradio modelscope onnxruntime librosa soundfile whisper; do
-    if "$VOICE_PY" -c "import $m" >/dev/null 2>&1; then ok "voice import $m"; else bad "voice import $m"; fi
+    if out=$("$VOICE_PY" -c "import $m" 2>&1); then ok "voice import $m"; else
+      bad "voice import $m :: $(printf '%s' "$out" | grep -aE 'Error|error' | tail -n1 | cut -c1-180)"
+    fi
   done
 fi
 
