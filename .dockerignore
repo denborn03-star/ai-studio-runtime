@@ -1,0 +1,10 @@
+# Build context = repository root. Only the Dockerfile, the authoritative locks
+# and the build-time validator are needed by the builder; everything else is
+# excluded so the context stays small and deterministic.
+.git/
+.github/
+reference/
+README.md
+GITHUB_HANDOFF.md
+*.tmp
+*.log
