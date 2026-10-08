@@ -67,6 +67,11 @@ RUN set -eux; \
         --extra-index-url "${VOICE_EXTRA_INDEX_URL}"
 
 # ---------------------------------------------------------------------------
+# Baked runtime marker (used by START/bootstrap to detect a prebuilt runtime).
+# Created BEFORE validation so the validator can assert its presence.
+RUN set -eux; \
+    printf '%s\n' "ai-studio-runtime baked" "main=3.12.3 torch 2.14.0+cu130" "voice=3.10.18 torch 2.7.1+cu128" > /root/aistudio-run/RUNTIME_BAKED.txt
+
 # BUILD-TIME VALIDATION - the build FAILS if any required runtime check fails.
 # No GPU is required (torch.cuda.init() is deliberately NOT called; host/CUDA
 # compatibility remains a runtime gate).
@@ -75,10 +80,6 @@ RUN set -eux; \
     chmod +x /usr/local/bin/validate-runtime.sh; \
     /usr/local/bin/validate-runtime.sh; \
     rm -rf /tmp/locks
-
-# Baked runtime markers (used by START/bootstrap to detect a prebuilt runtime).
-RUN set -eux; \
-    printf '%s\n' "ai-studio-runtime baked" "main=toolkit 3.12.3 torch 2.14.0+cu130" "voice=3.10.18 torch 2.7.1+cu128" > /root/aistudio-run/RUNTIME_BAKED.txt
 
 # No entrypoint override: the base image ENTRYPOINT (/start.sh) must keep
 # working so RunPod-driven startup (sshd, jupyter, env) is unchanged.
