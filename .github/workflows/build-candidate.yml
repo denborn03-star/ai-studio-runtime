@@ -1,0 +1,104 @@
+name: build-ai-studio-runtime-candidate
+
+# CANDIDATE-ONLY workflow. It builds Dockerfile.candidate-20261014 and publishes
+# it under candidate tags ONLY.
+#
+# HARD GUARANTEE: this workflow can never publish or retag production. The
+# production tag (runtime-20261008) and its digest
+# sha256:68219041e6ebdc53e256e9c8c27c3d33f2389afdb136c6784af8cf748a7199bd are
+# never named here, and build-image.yml (the production workflow) is untouched.
+#
+# DISPATCHABILITY: GitHub only offers this workflow in the Actions UI once this
+# file exists on the repository's DEFAULT branch (main). Commit it to main
+# first; no push trigger is configured, so a candidate build is always a
+# deliberate, manual action. (Adding this file does not match the production
+# workflow's `paths:` filter either, so production cannot rebuild by accident.)
+#
+# To build from a non-default branch, use:
+#   gh workflow run build-ai-studio-runtime-candidate.yml --ref <branch>
+#
+# Compression: the whole point of the candidate. `compression-level=9` with
+# `force-compression=true` recompresses EVERY layer at maximum gzip level -
+# including the 36 layers inherited from the base image, which Docker would
+# otherwise re-push with their original (lower-level) compression. Identical
+# decompressed content, smaller blobs. gzip is chosen over zstd deliberately:
+# zstd is smaller still, but gzip is universally pullable by any OCI runtime,
+# so the candidate cannot become unpullable on RunPod.
+#
+# `outputs` is used as the single source of truth for the exporter (push and
+# compression together) rather than mixing it with the `push`/`provenance`/
+# `sbom` shorthands, whose interaction with an explicit `outputs` is not
+# documented. `oci-mediatypes=true` keeps the OCI media types that production
+# already uses. Attestations are deliberately not produced for the candidate;
+# they are separate index manifests and do not affect the measured layer bytes.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-candidate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The runtime image is large (two baked venvs). Free the preinstalled
+      # toolchains so build + push do not exhaust the runner disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          docker image prune -af || true
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Candidate tags only. No 'latest'. No production tag.
+      - name: Candidate metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/ai-studio-runtime
+          tags: |
+            type=raw,value=candidate-20261014
+            type=sha,format=long,prefix=candidate-sha-
+
+      # The Dockerfile runs scripts/validate-runtime.sh as a build step, so a
+      # validation failure fails the build and NOTHING is pushed.
+      - name: Build and push candidate (linux/amd64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.candidate-20261014
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: >-
+            type=image,push=true,compression=gzip,compression-level=9,force-compression=true,oci-mediatypes=true
+
+      - name: Publish candidate digest
+        run: |
+          {
+            echo "### ai-studio-runtime CANDIDATE published (not production)"
+            echo ""
+            echo '```'
+            echo "CANDIDATE_DIGEST=${{ steps.build.outputs.digest }}"
+            echo "CANDIDATE_URI=ghcr.io/${{ github.repository_owner }}/ai-studio-runtime@${{ steps.build.outputs.digest }}"
+            echo '```'
+            echo ""
+            echo "Measure against production (run locally; read-only anonymous GHCR query):"
+            echo "  python scripts/compare-image-sizes.py runtime-20261008 candidate-20261014"
+          } >> "$GITHUB_STEP_SUMMARY"

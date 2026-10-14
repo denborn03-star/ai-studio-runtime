@@ -1,0 +1,171 @@
+# syntax=docker/dockerfile:1.7
+#
+# ============================================================================
+# CANDIDATE BUILD SOURCE - NOT PRODUCTION
+# ============================================================================
+# Do NOT tag this image as runtime-20261008 and do NOT retag the production
+# digest sha256:68219041e6ebdc53e256e9c8c27c3d33f2389afdb136c6784af8cf748a7199bd.
+# Publish only under a candidate tag (see .github/workflows/build-candidate.yml).
+#
+# What this candidate changes vs. the production Dockerfile - and nothing else:
+#   (1) LAYER SPLIT (cold start only - it removes no bytes). The two venv RUN
+#       steps are each split into "torch/CUDA group first, then the rest of the
+#       SAME lock". The largest blobs on the wire are currently one 3819 MiB
+#       layer and one 7380 MiB layer; a puller fetches layers concurrently, so
+#       four smaller blobs shorten the cold download. Docker layers are additive
+#       tar diffs, so layer boundaries do not change the resulting filesystem.
+#       To guarantee the split cannot duplicate or drift package data, the group
+#       step installs with --no-deps: it lays down ONLY the exact pinned wheels
+#       named in the lock (no transitive resolution), and the following step
+#       installs the FULL lock, which then supplies every dependency and the
+#       remaining packages. No file is therefore ever installed twice, and no
+#       unpinned version can be installed and later overwritten (an overwrite
+#       would leave the superseded bytes stranded in the earlier layer).
+#   (2) COMPRESSION LEVEL (this is what removes bytes). Built with gzip level 9
+#       and force-compression (see the candidate workflow): identical
+#       decompressed tar content, only compressed harder.
+#
+# What it deliberately does NOT change: base image digest, lock files (installed
+# in full, byte-identical), venv paths, package versions, entrypoint, validator,
+# markers, SSH/ComfyUI/Vision Web/voice behaviour.
+#
+# AI Studio reproducible runtime image
+# ------------------------------------
+# Source of truth: the authoritative freeze locks captured from the production
+# pod that passed regression 22/22 on 2026-10-08:
+#   requirements-main.lock   246 pins (Python 3.12.3, torch 2.14.0+cu130)
+#   requirements-voice.lock  178 pins (Python 3.10.18, torch 2.7.1+cu128)
+#
+# Layout note: the venvs are baked at the EXACT paths the existing bootstrap
+# already uses (/root/aistudio-run/venv-main, /root/aistudio-run/venv-voice).
+# The bootstrap's "if [ ! -x <venv>/bin/python ]" guards therefore see them as
+# already present and skip pip entirely:
+#   RUNTIME_PIP_INSTALL_ON_START = NO     (no START change required)
+#   SITE_PACKAGES_COPIED_FROM_GV = NO     (runtime is image-baked)
+#
+# The base image is pinned by IMMUTABLE DIGEST (multi-arch index digest).
+# Tag pinned here: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+#   index digest (used below)   : sha256:0a360022e8de4375af99430f84e8b38951acc397252163a37ceac7204d01be35
+#   linux/amd64 manifest digest : sha256:4d1721e62b56d345c83b4fd6090664be6daf9312caab5b2e76f23d8231941851
+FROM runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404@sha256:0a360022e8de4375af99430f84e8b38951acc397252163a37ceac7204d01be35
+
+LABEL org.opencontainers.image.title="ai-studio-runtime-candidate" \
+      org.opencontainers.image.description="CANDIDATE (unverified): AI Studio verified pod-local runtime, layer-split + high-compression build" \
+      org.opencontainers.image.source="https://github.com/OWNER/ai-studio-runtime" \
+      org.opencontainers.image.base.name="runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404" \
+      org.opencontainers.image.base.digest="sha256:0a360022e8de4375af99430f84e8b38951acc397252163a37ceac7204d01be35" \
+      ai-studio.candidate="true" \
+      ai-studio.candidate.based-on="runtime-20261008" \
+      ai-studio.runtime.main.python="3.12.3" \
+      ai-studio.runtime.main.torch="2.14.0+cu130" \
+      ai-studio.runtime.voice.python="3.10.18" \
+      ai-studio.runtime.voice.torch="2.7.1+cu128"
+
+ARG MAIN_INDEX_URL=https://download.pytorch.org/whl/cu130
+ARG VOICE_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128
+ARG PYPI_EXTRA_INDEX_URL=https://pypi.org/simple
+
+# CUDA/torch-bearing prefix of each lock (lock-driven, so versions can never
+# drift from the verified freeze). No package is omitted by this split: the FULL
+# lock is installed immediately afterwards. Unquoted deliberately - the value is
+# used inside double quotes in the RUN below.
+ARG TORCH_GROUP_REGEX=^(torch|torchvision|torchaudio|triton|nvidia-|cuda-|pytorch)
+
+COPY requirements-main.lock requirements-voice.lock /tmp/locks/
+COPY scripts/validate-runtime.sh /usr/local/bin/validate-runtime.sh
+
+# ---------------------------------------------------------------------------
+# MAIN runtime (Python 3.12) - layer A: venv + pip bootstrap
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    /usr/local/bin/python -m venv --system-site-packages /root/aistudio-run/venv-main; \
+    /root/aistudio-run/venv-main/bin/pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# ---------------------------------------------------------------------------
+# MAIN runtime - layer B: the CUDA/torch prefix of the lock (the bulk of this
+# venv: torch 2.14.0+cu130, torchvision, torchaudio, triton 3.8.0 and the
+# nvidia-*-cu13 wheels). nvidia-*-cu12 entries in the same group are already
+# present in the base image at identical versions and --system-site-packages
+# makes pip treat them as satisfied, exactly as in the production build.
+# --no-deps: lay down only these exact pins; the next step installs the full
+# lock, which supplies all transitive dependencies (see the header).
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    grep -E "${TORCH_GROUP_REGEX}" /tmp/locks/requirements-main.lock > /tmp/locks/main-torch-group.lock; \
+    test -s /tmp/locks/main-torch-group.lock; \
+    /root/aistudio-run/venv-main/bin/pip install --no-cache-dir --no-deps \
+        -r /tmp/locks/main-torch-group.lock \
+        --index-url "${MAIN_INDEX_URL}" \
+        --extra-index-url "${PYPI_EXTRA_INDEX_URL}"
+
+# ---------------------------------------------------------------------------
+# MAIN runtime - layer C: the FULL verified lock (ComfyUI / Studio / ReActor
+# stack). Installing the full lock last means the final environment is identical
+# to the production build's single-step install; the prefix above is only a
+# pre-install of a subset of the same pins.
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    /root/aistudio-run/venv-main/bin/pip install --no-cache-dir \
+        -r /tmp/locks/requirements-main.lock \
+        --index-url "${MAIN_INDEX_URL}" \
+        --extra-index-url "${PYPI_EXTRA_INDEX_URL}"
+
+# ---------------------------------------------------------------------------
+# VOICE runtime (Python 3.10) - layer A: isolated venv + pip bootstrap
+# (include-system-site-packages = false, as in the verified pyvenv.cfg)
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    /usr/bin/python3.10 -m venv /root/aistudio-run/venv-voice; \
+    /root/aistudio-run/venv-voice/bin/pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# ---------------------------------------------------------------------------
+# VOICE runtime - layer B: CUDA/torch prefix (torch 2.7.1+cu128, torchaudio,
+# triton 3.3.1 and the nvidia-*-cu12 wheels this isolated 3.10 venv must own;
+# they are NOT interchangeable with the base image's cu12 set, whose point
+# versions differ - hence no reuse attempt here). --no-deps as for main.
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    grep -E "${TORCH_GROUP_REGEX}" /tmp/locks/requirements-voice.lock > /tmp/locks/voice-torch-group.lock; \
+    test -s /tmp/locks/voice-torch-group.lock; \
+    /root/aistudio-run/venv-voice/bin/pip install --no-cache-dir --no-deps \
+        -r /tmp/locks/voice-torch-group.lock \
+        --extra-index-url "${VOICE_EXTRA_INDEX_URL}"
+
+# ---------------------------------------------------------------------------
+# VOICE runtime - layer C: the FULL verified voice lock (CosyVoice/whisper
+# stack).
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    /root/aistudio-run/venv-voice/bin/pip install --no-cache-dir \
+        -r /tmp/locks/requirements-voice.lock \
+        --extra-index-url "${VOICE_EXTRA_INDEX_URL}"
+
+# ---------------------------------------------------------------------------
+# Baked runtime marker (used by START/bootstrap to detect a prebuilt runtime).
+# Created BEFORE validation so the validator can assert its presence.
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    printf '%s\n' "ai-studio-runtime baked" "main=3.12.3 torch 2.14.0+cu130" "voice=3.10.18 torch 2.7.1+cu128" > /root/aistudio-run/RUNTIME_BAKED.txt
+
+# BUILD-TIME VALIDATION - unchanged gate: the build FAILS if any required
+# runtime check fails (interpreter versions, exact torch versions, exact CUDA
+# build strings, ComfyUI/Studio/ReActor/voice imports). No GPU is required;
+# host/CUDA compatibility remains a runtime gate.
+#
+# The two pip check calls below are MANDATORY BUILD GATES. With set -e,
+# a broken dependency graph fails the image build BEFORE any GHCR publication.
+# Separate in-image QG5 validation remains mandatory after the build.
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    chmod +x /usr/local/bin/validate-runtime.sh; \
+    /usr/local/bin/validate-runtime.sh; \
+    printf '\nPIP_CHECK_MAIN (diagnostic, non-fatal):\n'; \
+    /root/aistudio-run/venv-main/bin/pip check; \
+    printf '\nPIP_CHECK_VOICE (diagnostic, non-fatal):\n'; \
+    /root/aistudio-run/venv-voice/bin/pip check; \
+    printf '\nVENV_MAIN freeze lines: '; /root/aistudio-run/venv-main/bin/pip freeze 2>/dev/null | wc -l; \
+    printf 'VENV_VOICE freeze lines: '; /root/aistudio-run/venv-voice/bin/pip freeze 2>/dev/null | wc -l; \
+    rm -rf /tmp/locks
+
+# No entrypoint override: the base image ENTRYPOINT (/start.sh) must keep
+# working so RunPod-driven startup (sshd, jupyter, env) is unchanged.
